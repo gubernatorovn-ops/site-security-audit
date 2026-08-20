@@ -1,6 +1,6 @@
 ---
 name: site-security-audit
-description: Runs a hands-on security audit of a live website — headers, exposed config/backup files, an automated nuclei scan, live probing of login/registration forms for SQLi/NoSQLi/XSS and brute-force protection, and business-logic checks (mass assignment, price manipulation, IDOR) on custom APIs. Use this whenever the user asks to check a site for vulnerabilities, "проверь сайт на уязвимости", "пентест", "просканируй сайт", "есть ли дыры в безопасности", or wants a security review of their own website, web app, or API before/after a fix. Always confirms authorization before any active testing — refuses to actively scan a site the user doesn't own or isn't authorized to test. Also covers re-verifying fixes after the user reports deploying them, and drafting a fix-it prompt for a Claude Code session.
+description: Runs a hands-on security audit of a live website — headers, exposed config/backup files, an automated nuclei scan, CORS misconfiguration, cookie flags, open redirects, file-upload handling, live probing of login/registration forms for SQLi/NoSQLi/XSS and brute-force protection, and business-logic checks (mass assignment, price manipulation, IDOR) on custom APIs. Use this whenever the user asks to check a site for vulnerabilities, "проверь сайт на уязвимости", "пентест", "просканируй сайт", "есть ли дыры в безопасности", or wants a security review of their own website, web app, or API before/after a fix. Always confirms authorization before any active testing — refuses to actively scan a site the user doesn't own or isn't authorized to test. Also covers re-verifying fixes after the user reports deploying them, and drafting a fix-it prompt for a Claude Code session.
 ---
 
 # Site Security Audit
@@ -27,45 +27,48 @@ Use AskUserQuestion (or just ask directly in chat) with something like: "Это 
 Re-ask if the user brings a *new* domain mid-conversation — ownership doesn't carry over from a
 previous site just because the same person is asking.
 
-## Step 1: Recon
+## Step 1-2: Recon, exposed paths, CORS, cookies
+
+Run the bundled script to cover this mechanically instead of hand-typing the same curl loop
+every time:
 
 ```bash
-curl -sI -L --max-time 15 "https://target/"
-echo | openssl s_client -connect target:443 -servername target 2>/dev/null | openssl x509 -noout -dates -subject -issuer
-curl -sI --max-time 10 "http://target/"   # confirm HTTP->HTTPS redirect
+scripts/recon.sh https://target-site.com
 ```
 
-From the headers and page source, identify the stack (framework/CMS, hosting — e.g.
+It dumps headers, checks which of the standard security headers are missing
+(`Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`,
+`Permissions-Policy`, `Referrer-Policy` — missing ones are very often the single most impactful
+cheap fix on an otherwise-solid site), pulls the SSL cert dates, confirms the HTTP→HTTPS redirect,
+fingerprints whether the site has a real 404 or returns `200` for everything (critical context —
+see below), probes the common sensitive-path list from `references/payloads.md`, checks whether
+`Access-Control-Allow-Origin` reflects an arbitrary `Origin` header (CORS misconfiguration), and
+checks `Set-Cookie` headers for missing `Secure`/`HttpOnly`/`SameSite` flags.
+
+Read its output, don't just skim for red flags — several of its checks are judgment calls the
+script flags but can't resolve on its own:
+
+- **Fallback-page fingerprint matters most.** Some sites (misconfigured SPA fallback, PHP front
+  controllers) return `200` with the homepage for *any* unmatched path. If that's the pattern, a
+  `200` on a "sensitive" path is meaningless — the script compares byte size against the fallback
+  automatically and flags matches, but you still need to eyeball anything that returned `200`
+  with a *different* size, since that's the one that's actually real content.
+- A `403` with `x-vercel-mitigated: deny`, or a bot-challenge page (e.g. Beget's `beget=begetok`
+  cookie trick), means the *hosting platform* is blocking scanner-shaped requests — that's a
+  positive signal about the hosting layer, not a finding to report as a vuln. See
+  `references/hosting-quirks.md` for more platform-specific behavior like this before writing
+  something up as a bug.
+- CORS reflecting an arbitrary origin is only a real vulnerability if the response also carries
+  `Access-Control-Allow-Credentials: true` (otherwise there's no session/cookie to steal
+  cross-origin) — check both together before calling it critical.
+- The script only checks cookies set on the homepage. Re-run the cookie check by hand
+  (`curl -sI` on the actual login/session endpoint) if the homepage doesn't set any — session
+  cookies are usually only issued after authentication.
+
+From the headers and page source, also identify the stack (framework/CMS, hosting — e.g.
 Next.js/Payload/Vercel vs nginx+custom PHP vs WordPress vs static). This changes what's worth
 probing later (WordPress → wpscan-style paths matter; a Payload/Next app → look at its REST/GraphQL
 conventions instead).
-
-Check for these security headers and note which are **missing** — this is very often the single
-most impactful cheap fix on an otherwise-solid site:
-`Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`,
-`Permissions-Policy`, `Referrer-Policy`.
-
-## Step 2: Exposed paths
-
-Before testing anything, fingerprint how the site handles a **path that definitely doesn't
-exist**:
-
-```bash
-curl -s -o /dev/null -w "%{http_code} %{size_download}\n" "https://target/nonexistent-random-xyz$RANDOM"
-```
-
-Some sites (misconfigured SPA fallback, or PHP front controllers) return `200` with the homepage
-for *any* unmatched path. If that's the pattern, a `200` on a "sensitive" path below means
-nothing — compare byte size/content, not just status code, before calling anything "exposed".
-
-Then probe common sensitive paths the same way:
-`.env`, `.git/config`, `.git/HEAD`, `wp-config.php.bak`, `backup.zip`, `backup.sql`, `config.php`,
-`.htaccess`, `/admin`, `/wp-admin/`, `/wp-login.php`, `/phpmyadmin`, `xmlrpc.php`,
-`CHANGELOG.md`, `readme.html`, `/server-status`, `/.well-known/security.txt`.
-
-A `403` with something like `x-vercel-mitigated: deny` or a bot-challenge HTML page (e.g. Beget's
-`beget=begetok` cookie trick) means the *host* is blocking scanner-shaped requests — that's a
-positive signal about the hosting layer, not a finding to report as a vuln.
 
 ## Step 3: Automated scan (nuclei)
 
@@ -99,14 +102,9 @@ then test the underlying API directly with `curl` — bypassing client-side HTML
 (`type="email"` etc. will silently block malformed input at the browser layer and give you a
 false sense of security if you only test through the UI).
 
-Payloads to try against the login endpoint, checking that every response stays a generic
-"invalid credentials" with no SQL error, no timing tell, and no reflection:
-
-```bash
-curl -X POST "$LOGIN_URL" -H "Content-Type: application/json" -d '{"email":"'"' OR '1'='1' --","password":"x"}'
-curl -X POST "$LOGIN_URL" -H "Content-Type: application/json" -d '{"email":{"$gt":""},"password":{"$gt":""}}'
-curl -X POST "$LOGIN_URL" -H "Content-Type: application/json" -d '{"email":"<script>alert(1)</script>@test.com","password":"x"}'
-```
+Try the SQLi / NoSQLi / XSS payloads from `references/payloads.md` against the login endpoint,
+checking that every response stays a generic "invalid credentials" with no SQL error, no timing
+tell, and no reflection.
 
 **Brute-force / lockout test** — send 15-25 rapid failed attempts and watch for a lockout
 message or HTTP 429 appearing partway through. Important nuance: many auth systems (Payload CMS's
@@ -117,17 +115,26 @@ real accounts via someone else's email, and avoids a lockout-based user-enumerat
 If you only have a fake email to test with, say so explicitly in the report and ask the user for
 a real (disposable) test account before concluding brute-force protection is missing.
 
-**Mass-assignment test** on registration/creation endpoints — try slipping in fields the client
-shouldn't control: `role`, `isAdmin`, `wallet`, `price`, `verified`. If a record gets created,
-check whether the sensitive field is actually reflected/echoed — an API can validly omit a field
-from the response because the anonymous caller lacks *read* access to it, which doesn't prove the
-value wasn't set. Say this explicitly rather than declaring victory or failure from the response
-alone; recommend the user check their DB/admin panel for ground truth.
+**Mass-assignment test** on registration/creation endpoints — try slipping in the extra fields
+listed in `references/payloads.md` (`role`, `isAdmin`, `wallet`, `price`, `verified`, ...). If a
+record gets created, check whether the sensitive field is actually reflected/echoed — an API can
+validly omit a field from the response because the anonymous caller lacks *read* access to it,
+which doesn't prove the value wasn't set. Say this explicitly rather than declaring victory or
+failure from the response alone; recommend the user check their DB/admin panel for ground truth.
 
 Always label test data unmistakably (e.g. name `"SECTEST DoNotUse"`) and tell the user afterward
 exactly which record(s) to delete — collection/table, id, and identifying field. If no delete
 endpoint is reachable anonymously, say that's actually a good sign (no IDOR on delete) but that
 manual cleanup is still needed.
+
+**Open redirect** — on any parameter that looks like it controls a post-action destination
+(`redirect`, `next`, `url`, `return`, `callback`), try the payloads in `references/payloads.md`
+and check whether the `Location` header ends up pointing at an attacker-controlled host.
+
+**File upload** (if the site has any upload form — avatar, attachment, document) — see the
+probes in `references/payloads.md`. The goal is proving the server accepts and serves back a
+mismatched file type as-is; there's no need to prove actual code execution against a real
+production box.
 
 ## Step 5: Business-logic / IDOR testing
 
